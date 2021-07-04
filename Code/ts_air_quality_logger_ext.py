@@ -1,41 +1,36 @@
-\
+import json
 import time
-from datetime import datetime
-import paho.mqtt.client as mqtt
-import psutil
 from sds011 import *
 import aqi
+from datetime import datetime
+import paho.mqtt.client as mqtt
 
 sensor = SDS011("/dev/ttyUSB0", use_query_mode=True)
+THINGSBOARD_HOST = '10.0.0.61'
+ACCESS_TOKEN = 'x=zR]:fTZR'
 
-# The callback for when the client receives a CONNACK response from the server.
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        print("Connected successfully")
-    else:
-        print("Connect returned result code: " + str(rc))
+# Data capture and upload interval in seconds. Less interval will eventually hang the DHT22.
+INTERVAL = 30
 
-# The callback for when a PUBLISH message is received from the server.
-def on_message(client, userdata, msg):
-    print("Received message: " + msg.topic + " -> " + msg.payload.decode("utf-8"))
+sensor_data = {'pmt_2_5': 0, 'aqi_2_5': 0, 'pmt_10': 0, 'aqi_10': 0}
 
 
 def get_data(n=3):
-        sensor.sleep(sleep=False)
-        pmt_2_5 = 0
-        pmt_10 = 0
-        time.sleep(30)
-        for i in range (n):
-            x = sensor.query()
-            pmt_2_5 = pmt_2_5 + x[0]
-            pmt_10 = pmt_10 + x[1]
-            time.sleep(10)
-        pmt_2_5 = round(pmt_2_5/n, 1)
-        pmt_10 = round(pmt_10/n, 1)
-        sensor.sleep(sleep=True)
+    sensor.sleep(sleep=False)
+    pmt_2_5 = 0
+    pmt_10 = 0
+    time.sleep(30)
+    for i in range(n):
+        x = sensor.query()
+        pmt_2_5 = pmt_2_5 + x[0]
+        pmt_10 = pmt_10 + x[1]
         time.sleep(10)
-        return pmt_2_5, pmt_10
-    
+    pmt_2_5 = round(pmt_2_5 / n, 1)
+    pmt_10 = round(pmt_10 / n, 1)
+    sensor.sleep(sleep=True)
+    time.sleep(10)
+    return pmt_2_5, pmt_10
+
 
 def conv_aqi(pmt_2_5, pmt_10):
     aqi_2_5 = aqi.to_iaqi(aqi.POLLUTANT_PM25, str(pmt_2_5))
@@ -43,44 +38,50 @@ def conv_aqi(pmt_2_5, pmt_10):
     return aqi_2_5, aqi_10
 
 
-def save_log():        
+def save_log():
     with open("air_quality.csv", "a") as log:
         dt = datetime.now()
         log.write("{},{},{},{},{}\n".format(dt, pmt_2_5, aqi_2_5, pmt_10, aqi_10))
     log.close()
 
-# create the client
+
+next_reading = time.time()
+
 client = mqtt.Client()
-client.on_connect = on_connect
-client.on_message = on_message
 
-# enable TLS
-client.tls_set(tls_version=mqtt.ssl.PROTOCOL_TLS)
+# Set access token
+client.username_pw_set(ACCESS_TOKEN)
 
-# set username and password
-client.username_pw_set("Albardin", "Password")
+# Connect to ThingsBoard using default MQTT port and 60 seconds keep alive interval
+client.connect(THINGSBOARD_HOST, 1883, 60)
 
-# connect to HiveMQ Cloud on port 8883
-client.connect("52267785dc8c4134a1bcd0ad0d491cf9.s1.eu.hivemq.cloud", 8883)
+client.loop_start()
 
-# subscribe to the topic "my/test/topic"
-client.subscribe("project/air/report")
+try:
+    while True:
+        pmt_2_5, pmt_10 = get_data()
+        aqi_2_5, aqi_10 = conv_aqi(pmt_2_5, pmt_10)
+        sensor_data['pmt_2_5'] = pmt_2_5
+        sensor_data['pmt_10'] = pmt_10
+        sensor_data['aqi_2_5'] = aqi_2_5
+        sensor_data['aqi_10'] = aqi_10
 
-while True:        
-    pmt_2_5, pmt_10 = get_data()
-    aqi_2_5, aqi_10 = conv_aqi(pmt_2_5, pmt_10)
-    tPayload = "field1=" + str(pmt_2_5)+ "&field2=" + str(aqi_2_5)+ "&field3=" + str(pmt_10)+ "&field4=" + str(aqi_10)
-    try:
-        # publish "Hello" to the topic "my/test/topic"
-        client.publish(tPayload)
-        # Blocking call that processes network traffic, dispatches callbacks and handles reconnecting.
-        client.loop_forever()
-        time.sleep(600)
-    except:
-        print ("[INFO] Failure in sending data")
-        
-        
-            
-            
+        # save log as csv
+        try:
+            save_log()
+        except:
+            print("[INFO] Failure in logging data")
+        time.sleep(5)
 
+        # Sending humidity and temperature data to ThingsBoard
+        client.publish('v1/devices/me/telemetry', json.dumps(sensor_data), 1)
 
+        next_reading += INTERVAL
+        sleep_time = next_reading - time.time()
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+except KeyboardInterrupt:
+    pass
+
+client.loop_stop()
+client.disconnect()
